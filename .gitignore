@@ -1,5 +1,31 @@
 __pycache__/
 Models/
 
+# Add large model checkpoints and logs
+*.pth
+*.t7
+*.log
+*.zip
+*.ckpt
+*.pt
+
+# Add tensorboard logs
+tensorboard/
+logs/
+
+# Add local datasets and audio
+/data/
+Data/
+filelists/
+*.wav
+*.mp3
+
+# Add notebook outputs
+*.ipynb_checkpoints/
+
+# Add user-generated outputs
+train_output.log
+reference_audio.zip
+
 # local datasets
 /data/

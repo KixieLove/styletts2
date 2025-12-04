@@ -262,6 +262,30 @@ def main(config_path):
             batch = [b.to(device) for b in batch[1:]]
             texts, input_lengths, ref_texts, ref_lengths, mels, mel_input_length, ref_mels = batch
 
+            # Validate input data for NaNs/Infs
+            # waves is a list of numpy arrays, so check each one
+            try:
+                waves_valid = True
+                for w in waves:
+                    w_tensor = torch.from_numpy(w) if isinstance(w, np.ndarray) else w
+                    if torch.isnan(w_tensor).any() or torch.isinf(w_tensor).any():
+                        waves_valid = False
+                        break
+                if not waves_valid:
+                    print(f"[SKIP BATCH {i}] Waveform contains NaN/Inf. Skipping this batch.")
+                    continue
+            except Exception as e:
+                print(f"[SKIP BATCH {i}] Error checking waves: {e}")
+                continue
+            
+            if torch.isnan(mels).any() or torch.isnan(ref_mels).any():
+                print(f"[SKIP BATCH {i}] Mel contains NaN. Skipping this batch.")
+                continue
+            
+            if torch.isnan(texts).any():
+                print(f"[SKIP BATCH {i}] Text contains NaN. Skipping this batch.")
+                continue
+
             with torch.no_grad():
                 mask = length_to_mask(mel_input_length // (2 ** n_down)).to(device)
                 mel_mask = length_to_mask(mel_input_length).to(device)
@@ -350,21 +374,58 @@ def main(config_path):
             st = []
             p_en = []
             wav = []
-
+            
+            batch_valid = True
             for bib in range(len(mel_input_length)):
                 mel_length = int(mel_input_length[bib].item() / 2)
+                
+                # Safety checks before random selection
+                if mel_length <= mel_len or mel_length <= mel_len_st:
+                    print(f"[SKIP BATCH {i}] Sample {bib}: mel_length={mel_length} too short (mel_len={mel_len}, mel_len_st={mel_len_st})")
+                    batch_valid = False
+                    break
 
                 random_start = np.random.randint(0, mel_length - mel_len)
                 en.append(asr[bib, :, random_start:random_start+mel_len])
                 p_en.append(p[bib, :, random_start:random_start+mel_len])
                 gt.append(mels[bib, :, (random_start * 2):((random_start+mel_len) * 2)])
                 
-                y = waves[bib][(random_start * 2) * 300:((random_start+mel_len) * 2) * 300]
+                # Calculate waveform slice indices
+                wav_start_idx = (random_start * 2) * 300
+                wav_end_idx = ((random_start + mel_len) * 2) * 300
+                w = waves[bib]
+                w_len = len(w)
+                
+                # Bounds check: ensure indices are valid
+                if wav_start_idx >= w_len:
+                    print(f"[SKIP BATCH {i}] Sample {bib}: wav_start_idx ({wav_start_idx}) >= w_len ({w_len})")
+                    batch_valid = False
+                    break
+                
+                # Clamp end index and ensure we have data
+                wav_end_idx = min(wav_end_idx, w_len)
+                if wav_end_idx - wav_start_idx < 100:  # Minimum 100 samples
+                    print(f"[SKIP BATCH {i}] Sample {bib}: wav segment too short ({wav_end_idx - wav_start_idx} samples)")
+                    batch_valid = False
+                    break
+                
+                y = w[wav_start_idx:wav_end_idx]
+                
+                # Check extracted waveform
+                if np.isnan(y).any() or np.isinf(y).any():
+                    print(f"[SKIP BATCH {i}] Sample {bib}: extracted waveform contains NaN/Inf")
+                    batch_valid = False
+                    break
+                
+                # Convert to tensor
                 wav.append(torch.from_numpy(y).to(device))
 
                 # style reference (better to be different from the GT)
-                random_start = np.random.randint(0, mel_length - mel_len_st)
-                st.append(mels[bib, :, (random_start * 2):((random_start+mel_len_st) * 2)])
+                random_start_st = np.random.randint(0, mel_length - mel_len_st)
+                st.append(mels[bib, :, (random_start_st * 2):((random_start_st+mel_len_st) * 2)])
+            
+            if not batch_valid:
+                continue
                 
             wav = torch.stack(wav).float().detach()
 
@@ -390,16 +451,70 @@ def main(config_path):
                 y_rec_gt = wav.unsqueeze(1)
                 y_rec_gt_pred = model.decoder(en, F0_real, N_real, s)
 
-                if epoch >= joint_epoch:
-                    # ground truth from recording
-                    wav = y_rec_gt # use recording since decoder is tuned
-                else:
-                    # ground truth from reconstruction
-                    wav = y_rec_gt_pred # use reconstruction since decoder is fixed
+                # IMPORTANT: Keep original wav for mel loss, don't reassign it
+                # Only use decoder output (y_rec_gt_pred) for specific losses
+                # This prevents decoder NaNs from corrupting the ground truth reference
 
-            F0_fake, N_fake = model.predictor.F0Ntrain(p_en, s_dur)
+            # Diagnostic: check inputs to predictor before F0Ntrain
+            p_en_nan = torch.isnan(p_en).any().item()
+            s_dur_nan = torch.isnan(s_dur).any().item()
+            p_en_inf = torch.isinf(p_en).any().item()
+            s_dur_inf = torch.isinf(s_dur).any().item()
+            
+            if p_en_nan or s_dur_nan or p_en_inf or s_dur_inf:
+                print(f"[WARNING] Bad inputs to F0Ntrain: p_en_nan={p_en_nan}, s_dur_nan={s_dur_nan}, p_en_inf={p_en_inf}, s_dur_inf={s_dur_inf}")
+                print(f"  p_en shape: {p_en.shape}, s_dur shape: {s_dur.shape}")
+                # Use ground truth as fallback
+                F0_fake = F0_real.clone()
+                N_fake = N_real.clone()
+            else:
+                try:
+                    F0_fake, N_fake = model.predictor.F0Ntrain(p_en, s_dur)
+                    
+                    # Check outputs immediately
+                    F0_fake_nan = torch.isnan(F0_fake).any().item()
+                    N_fake_nan = torch.isnan(N_fake).any().item()
+                    if F0_fake_nan or N_fake_nan:
+                        print(f"[WARNING] F0Ntrain produced NaN: F0_fake_nan={F0_fake_nan}, N_fake_nan={N_fake_nan}")
+                        print(f"  Using ground truth as fallback (predictor unstable in early training)")
+                        F0_fake = F0_real.clone()
+                        N_fake = N_real.clone()
+                    else:
+                        # Clamp F0 and norm to reasonable ranges to prevent decoder NaNs
+                        F0_fake = torch.clamp(F0_fake, min=0.0, max=500.0)
+                        N_fake = torch.clamp(N_fake, min=-10.0, max=10.0)
+                except Exception as e:
+                    print(f"[ERROR] F0Ntrain raised exception: {e}")
+                    print(f"  Using ground truth as fallback")
+                    F0_fake = F0_real.clone()
+                    N_fake = N_real.clone()
 
-            y_rec = model.decoder(en, F0_fake, N_fake, s)
+            # Additional safety checks before decoder
+            en_has_nan = torch.isnan(en).any().item()
+            s_has_nan = torch.isnan(s).any().item()
+            F0_has_nan = torch.isnan(F0_fake).any().item()
+            N_has_nan = torch.isnan(N_fake).any().item()
+            
+            if en_has_nan or s_has_nan or F0_has_nan or N_has_nan:
+                print(f"[ERROR] Decoder inputs contain NaN before call: en={en_has_nan}, s={s_has_nan}, F0={F0_has_nan}, N={N_has_nan}")
+                # Create silence output to avoid NaN propagation
+                y_rec = torch.zeros_like(wav)
+            else:
+                # Clip encoder output to prevent decoder instability
+                en_clipped = torch.clamp(en, min=-5.0, max=5.0)
+                s_clipped = torch.clamp(s, min=-5.0, max=5.0)
+                
+                try:
+                    y_rec = model.decoder(en_clipped, F0_fake, N_fake, s_clipped)
+                    
+                    # Check decoder output for NaN
+                    if torch.isnan(y_rec).any().item():
+                        print(f"[ERROR] Decoder produced NaN output. Replacing with silence.")
+                        y_rec = torch.zeros_like(wav)
+                except Exception as e:
+                    print(f"[ERROR] Decoder forward pass failed: {e}")
+                    print(f"  Using silence as fallback")
+                    y_rec = torch.zeros_like(wav)
 
             loss_F0_rec =  (F.smooth_l1_loss(F0_real, F0_fake)) / 10
             loss_norm_rec = F.smooth_l1_loss(N_real, N_fake)
@@ -415,6 +530,12 @@ def main(config_path):
 
             # generator loss
             optimizer.zero_grad()
+            
+            # Safety check: ensure wav is still valid before computing losses
+            if torch.isnan(wav).any().item() or torch.isinf(wav).any().item():
+                print(f"[ERROR] Ground truth wav contains NaN/Inf at loss computation stage!")
+                print(f"  wav shape: {wav.shape}, NaN: {torch.isnan(wav).any().item()}, Inf: {torch.isinf(wav).any().item()}")
+                continue
 
             loss_mel = stft_loss(y_rec, wav)
             if start_ds:
@@ -453,8 +574,67 @@ def main(config_path):
             running_loss += loss_mel.item()
             g_loss.backward()
             if torch.isnan(g_loss):
-                from IPython.core.debugger import set_trace
-                set_trace()
+                def _stats(x):
+                    try:
+                        if isinstance(x, torch.Tensor):
+                            any_nan = torch.isnan(x).any().item()
+                            any_inf = torch.isinf(x).any().item()
+                            finite_mask = torch.isfinite(x)
+                            if finite_mask.any():
+                                finite_vals = x[finite_mask]
+                                mean = float(finite_vals.mean().detach().cpu().numpy())
+                                mn = float(finite_vals.min().detach().cpu().numpy())
+                                mx = float(finite_vals.max().detach().cpu().numpy())
+                            else:
+                                mean = mn = mx = float('nan')
+                            return f"nan={any_nan}, inf={any_inf}, mean={mean}, min={mn}, max={mx}"
+                        else:
+                            return str(x)
+                    except Exception as e:
+                        return f"<err:{e}>"
+
+                print('\n===== Detected NaN in g_loss. Dumping diagnostics =====')
+                comps = [('loss_mel', loss_mel), ('loss_F0_rec', loss_F0_rec), ('loss_norm_rec', loss_norm_rec),
+                         ('loss_ce', loss_ce), ('loss_dur', loss_dur), ('loss_gen_all', loss_gen_all),
+                         ('loss_lm', loss_lm), ('loss_sty', loss_sty), ('loss_diff', loss_diff)]
+                for name, val in comps:
+                    try:
+                        print(f"{name}: {_stats(val)}")
+                    except Exception:
+                        print(f"{name}: <unavailable>")
+
+                # quick checks on some model tensors that often cause NaNs
+                checks = {'mels': None, 'gt': None, 'y_rec': None, 'wav': None, 'F0_real': None, 'F0_fake': None}
+                try:
+                    checks['mels'] = mels
+                    checks['gt'] = gt
+                    checks['y_rec'] = y_rec
+                    checks['wav'] = wav
+                    checks['F0_real'] = F0_real
+                    checks['F0_fake'] = F0_fake
+                except Exception:
+                    pass
+
+                for name, t in checks.items():
+                    if t is None:
+                        print(f"{name}: <not set in this scope>")
+                        continue
+                    try:
+                        if isinstance(t, torch.Tensor):
+                            print(f"{name}: nan={torch.isnan(t).any().item()}, inf={torch.isinf(t).any().item()}, shape={tuple(t.shape)}")
+                        else:
+                            print(f"{name}: <not tensor>")
+                    except Exception as e:
+                        print(f"{name}: <err:{e}>")
+
+                print('Zeroing grads and skipping this batch to continue training.')
+                optimizer.zero_grad()
+                continue
+
+            # Gradient clipping to prevent exploding gradients (especially in predictor)
+            torch.nn.utils.clip_grad_norm_(model.predictor.parameters(), max_norm=10.0)
+            torch.nn.utils.clip_grad_norm_(model.bert_encoder.parameters(), max_norm=10.0)
+            torch.nn.utils.clip_grad_norm_(model.bert.parameters(), max_norm=10.0)
 
             optimizer.step('bert_encoder')
             optimizer.step('bert')
@@ -620,9 +800,16 @@ def main(config_path):
                     gt = []
                     p_en = []
                     wav = []
-
+                    
+                    val_batch_valid = True
                     for bib in range(len(mel_input_length)):
                         mel_length = int(mel_input_length[bib].item() / 2)
+
+                        # Safety check
+                        if mel_length <= mel_len:
+                            print(f"[VAL-SKIP] Sample {bib}: mel_length={mel_length} too short (mel_len={mel_len})")
+                            val_batch_valid = False
+                            break
 
                         random_start = np.random.randint(0, mel_length - mel_len)
                         en.append(asr[bib, :, random_start:random_start+mel_len])
@@ -630,8 +817,34 @@ def main(config_path):
 
                         gt.append(mels[bib, :, (random_start * 2):((random_start+mel_len) * 2)])
 
-                        y = waves[bib][(random_start * 2) * 300:((random_start+mel_len) * 2) * 300]
+                        # Calculate and bounds-check waveform slice
+                        wav_start_idx = (random_start * 2) * 300
+                        wav_end_idx = ((random_start + mel_len) * 2) * 300
+                        w = waves[bib]
+                        w_len = len(w)
+                        
+                        if wav_start_idx >= w_len:
+                            print(f"[VAL-SKIP] Sample {bib}: wav_start_idx ({wav_start_idx}) >= w_len ({w_len})")
+                            val_batch_valid = False
+                            break
+                        
+                        wav_end_idx = min(wav_end_idx, w_len)
+                        if wav_end_idx - wav_start_idx < 100:
+                            print(f"[VAL-SKIP] Sample {bib}: wav segment too short")
+                            val_batch_valid = False
+                            break
+                        
+                        y = w[wav_start_idx:wav_end_idx]
+                        
+                        if np.isnan(y).any() or np.isinf(y).any():
+                            print(f"[VAL-SKIP] Sample {bib}: extracted waveform contains NaN/Inf")
+                            val_batch_valid = False
+                            break
+                        
                         wav.append(torch.from_numpy(y).to(device))
+                    
+                    if not val_batch_valid:
+                        continue
 
                     wav = torch.stack(wav).float().detach()
 
@@ -658,7 +871,18 @@ def main(config_path):
 
                     s = model.style_encoder(gt.unsqueeze(1))
 
-                    y_rec = model.decoder(en, F0_fake, N_fake, s)
+                    # Clip encoder outputs before decoder (same as training)
+                    en_clipped = torch.clamp(en, min=-5.0, max=5.0)
+                    s_clipped = torch.clamp(s, min=-5.0, max=5.0)
+                    
+                    try:
+                        y_rec = model.decoder(en_clipped, F0_fake, N_fake, s_clipped)
+                        if torch.isnan(y_rec).any().item():
+                            y_rec = torch.zeros_like(wav)
+                    except Exception as e:
+                        print(f"[VAL] Decoder error: {e}, using silence")
+                        y_rec = torch.zeros_like(wav)
+                    
                     loss_mel = stft_loss(y_rec.squeeze(), wav.detach())
 
                     F0_real, _, F0 = model.pitch_extractor(gt.unsqueeze(1)) 

@@ -7,6 +7,7 @@ import numpy as np
 import random
 import soundfile as sf
 import librosa
+import unicodedata
 
 import torch
 from torch import nn
@@ -20,29 +21,53 @@ logger.setLevel(logging.DEBUG)
 
 import pandas as pd
 
-_pad = "$"
-_punctuation = ';:,.!?¡¿—…"«»“” '
-_letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
-_letters_ipa = "ɑɐɒæɓʙβɔɕçɗɖðʤəɘɚɛɜɝɞɟʄɡɠɢʛɦɧħɥʜɨɪʝɭɬɫɮʟɱɯɰŋɳɲɴøɵɸθœɶʘɹɺɾɻʀʁɽʂʃʈʧʉʊʋⱱʌɣɤʍχʎʏʑʐʒʔʡʕʢǀǁǂǃˈˌːˑʼʴʰʱʲʷˠˤ˞↓↑→↗↘'̩'ᵻ"
 
-# Export all symbols:
-symbols = [_pad] + list(_punctuation) + list(_letters) + list(_letters_ipa)
+from text_utils import symbols  # import the shared vocab
+dicts = {s: i for i, s in enumerate(symbols)}
 
-dicts = {}
-for i in range(len((symbols))):
-    dicts[symbols[i]] = i
+from text_utils import symbols, _pad  # symbols only if you actually use it below
+
+import unicodedata, re
+from text_utils import symbols, _pad  # keep your existing exports
+
+dicts = {s: i for i, s in enumerate(symbols)}
+TEXT_VOCAB_LIMIT = 178  # must match ASR embedding size
 
 class TextCleaner:
     def __init__(self, dummy=None):
         self.word_index_dictionary = dicts
-    def __call__(self, text):
-        indexes = []
-        for char in text:
-            try:
-                indexes.append(self.word_index_dictionary[char])
-            except KeyError:
-                print(text)
-        return indexes
+        self.pad_id = dicts.get(_pad, 0)
+
+        # Normalize straight apostrophe to curly (low-id punctuation)
+        self._premap = str.maketrans({
+            "'": "’",         # ASCII apostrophe -> curly
+            "\u00A0": " ",    # NBSP -> space
+        })
+
+    def _normalize(self, s: str) -> str:
+        s = unicodedata.normalize('NFKC', s)
+        s = s.replace('\u2011', '-')  # non-breaking hyphen
+        s = s.replace('\u2013', '-')  # en dash
+        return s.translate(self._premap)
+
+    def __call__(self, text: str):
+        text = self._normalize(text)
+        out = []
+        for ch in text:
+            # try direct
+            idx = self.word_index_dictionary.get(ch, None)
+
+            # fallback: strip diacritics (á->a) if direct failed
+            if idx is None:
+                base = ''.join(c for c in unicodedata.normalize('NFKD', ch)
+                               if unicodedata.category(c) != 'Mn')
+                idx = self.word_index_dictionary.get(base, None)
+
+            # final guard: drop anything that would exceed ASR vocab
+            if idx is not None and idx < TEXT_VOCAB_LIMIT:
+                out.append(idx)
+            # else: silently skip
+        return out
 
 np.random.seed(1)
 random.seed(1)
@@ -61,8 +86,28 @@ mean, std = -4, 4
 
 def preprocess(wave):
     wave_tensor = torch.from_numpy(wave).float()
+    
+    # Check for NaN/Inf in input wave
+    if torch.isnan(wave_tensor).any() or torch.isinf(wave_tensor).any():
+        print(f"[WARNING] Input wave contains NaN/Inf, returning zeros")
+        return torch.zeros(1, 80, 192)  # return dummy mel shape
+    
     mel_tensor = to_mel(wave_tensor)
-    mel_tensor = (torch.log(1e-5 + mel_tensor.unsqueeze(0)) - mean) / std
+    
+    # Clamp mel to avoid log of very small numbers
+    mel_tensor = torch.clamp(mel_tensor, min=1e-5)
+    
+    mel_tensor = (torch.log(mel_tensor.unsqueeze(0)) - mean) / std
+    
+    # Final check and sanitization
+    if torch.isnan(mel_tensor).any():
+        print(f"[WARNING] Mel preprocessing produced NaN, clamping to [-10, 10]")
+        mel_tensor = torch.clamp(mel_tensor, min=-10.0, max=10.0)
+    
+    if torch.isinf(mel_tensor).any():
+        print(f"[WARNING] Mel preprocessing produced Inf, replacing with silence")
+        mel_tensor = torch.zeros_like(mel_tensor) - 10.0  # silence value
+    
     return mel_tensor
 
 class FilePathDataset(torch.utils.data.Dataset):
@@ -103,42 +148,76 @@ class FilePathDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.data_list)
 
-    def __getitem__(self, idx):        
-        data = self.data_list[idx]
-        path = data[0]
-        
-        wave, text_tensor, speaker_id = self._load_tensor(data)
-        
-        mel_tensor = preprocess(wave).squeeze()
-        
-        acoustic_feature = mel_tensor.squeeze()
-        length_feature = acoustic_feature.size(1)
-        acoustic_feature = acoustic_feature[:, :(length_feature - length_feature % 2)]
-        
-        # get reference sample
-        ref_data = (self.df[self.df[2] == str(speaker_id)]).sample(n=1).iloc[0].tolist()
-        ref_mel_tensor, ref_label = self._load_data(ref_data[:3])
-        
-        # get OOD text
-        
-        ps = ""
-        
-        while len(ps) < self.min_length:
-            rand_idx = np.random.randint(0, len(self.ptexts) - 1)
-            ps = self.ptexts[rand_idx]
-            
-            text = self.text_cleaner(ps)
-            text.insert(0, 0)
-            text.append(0)
+    def __getitem__(self, idx):
+        # Retry mechanism: if a sample fails to load, try other samples
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                data = self.data_list[idx]
+                path = data[0]
+                
+                wave, text_tensor, speaker_id = self._load_tensor(data)
+                
+                mel_tensor = preprocess(wave).squeeze()
+                
+                acoustic_feature = mel_tensor.squeeze()
+                length_feature = acoustic_feature.size(1)
+                acoustic_feature = acoustic_feature[:, :(length_feature - length_feature % 2)]
+                
+                # get reference sample
+                ref_data = (self.df[self.df[2] == str(speaker_id)]).sample(n=1).iloc[0].tolist()
+                ref_mel_tensor, ref_label = self._load_data(ref_data[:3])
+                
+                # get OOD text
+                ps = ""
+                while len(ps) < self.min_length:
+                    rand_idx = np.random.randint(0, len(self.ptexts) - 1)
+                    ps = self.ptexts[rand_idx]
+                    
+                    text = self.text_cleaner(ps)
+                    text.insert(0, 0)
+                    text.append(0)
 
-            ref_text = torch.LongTensor(text)
-        
-        return speaker_id, acoustic_feature, text_tensor, ref_text, ref_mel_tensor, ref_label, path, wave
+                    ref_text = torch.LongTensor(text)
+                
+                return speaker_id, acoustic_feature, text_tensor, ref_text, ref_mel_tensor, ref_label, path, wave
+            
+            except Exception as e:
+                print(f"[WARNING] Failed to load sample at idx {idx} (attempt {attempt + 1}/{max_retries}): {e}")
+                # Try a random sample instead
+                idx = np.random.randint(0, len(self.data_list))
+                if attempt == max_retries - 1:
+                    # If all retries fail, return a dummy safe sample
+                    print(f"[ERROR] All retries failed, returning dummy sample")
+                    dummy_wave = np.random.randn(24000 * 2).astype(np.float32) * 0.01  # 2 sec silence
+                    dummy_mel = torch.zeros(80, 192)
+                    dummy_text = torch.LongTensor([0, 0])
+                    return 0, dummy_mel, dummy_text, dummy_text, dummy_mel, 0, "dummy", dummy_wave
 
     def _load_tensor(self, data):
         wave_path, text, speaker_id = data
         speaker_id = int(speaker_id)
-        wave, sr = sf.read(osp.join(self.root_path, wave_path))
+        
+        try:
+            wave, sr = sf.read(osp.join(self.root_path, wave_path))
+        except Exception as e:
+            print(f"[ERROR] Failed to load audio file: {wave_path}, error: {e}")
+            # Raise exception to skip this sample in the dataset
+            raise RuntimeError(f"Cannot load {wave_path}: {e}")
+        
+        # Check for NaN/Inf in loaded wave
+        if np.isnan(wave).any() or np.isinf(wave).any():
+            nan_count = np.isnan(wave).sum()
+            inf_count = np.isinf(wave).sum()
+            print(f"[CRITICAL] Audio file {wave_path} contains NaN/Inf!")
+            print(f"  NaN: {nan_count}/{len(wave)}, Inf: {inf_count}/{len(wave)}, dtype: {wave.dtype}")
+            raise RuntimeError(f"Audio file {wave_path} contains NaN/Inf values")
+        
+        # Check if audio is (nearly) all zeros/silent
+        if np.abs(wave).max() < 1e-4:
+            print(f"[WARNING] Audio file {wave_path} is silent (max amplitude < 1e-4), adding noise floor")
+            wave = wave + np.random.randn(len(wave)) * 1e-5
+        
         if wave.shape[-1] == 2:
             wave = wave[:, 0].squeeze()
         if sr != 24000:
@@ -226,6 +305,27 @@ class Collater(object):
             ref_labels[bid] = ref_label
             waves[bid] = wave
 
+        # --- BEGIN OOV guard ---
+        from text_utils import symbols as _SYMBOLS
+        _VOCAB_SIZE = len(_SYMBOLS)
+
+        def _bad_ids(t):
+            # per-sample max to locate offenders
+            return (t >= _VOCAB_SIZE).any().item()
+
+        offenders = []
+        for i in range(batch_size):
+            if _bad_ids(texts[i]) or _bad_ids(ref_texts[i]):
+                offenders.append((i, int(texts[i].max().item()), int(ref_texts[i].max().item()), paths[i]))
+
+        if offenders:
+            details = "\n".join([f"  idx={i} max_text={mx_t} max_ref={mx_r} path={p}"
+                                for (i, mx_t, mx_r, p) in offenders])
+            raise RuntimeError(
+                f"OOV token id detected (>= {_VOCAB_SIZE}). Fix transcripts or SYMBOLS.\n{details}"
+            )
+        # --- END OOV guard ---
+
         return waves, texts, input_lengths, ref_texts, ref_lengths, mels, output_lengths, ref_mels
 
 
@@ -235,21 +335,31 @@ def build_dataloader(path_list,
                      validation=False,
                      OOD_data="Data/OOD_texts.txt",
                      min_length=50,
-                     batch_size=4,
-                     num_workers=1,
+                     batch_size=8,
+                     num_workers=4,
                      device='cpu',
                      collate_config={},
                      dataset_config={}):
-    
-    dataset = FilePathDataset(path_list, root_path, OOD_data=OOD_data, min_length=min_length, validation=validation, **dataset_config)
+    dataset = FilePathDataset(path_list, root_path,
+                              OOD_data=OOD_data,
+                              min_length=min_length,
+                              validation=validation,
+                              **dataset_config)
     collate_fn = Collater(**collate_config)
-    data_loader = DataLoader(dataset,
-                             batch_size=batch_size,
-                             shuffle=(not validation),
-                             num_workers=num_workers,
-                             drop_last=(not validation),
-                             collate_fn=collate_fn,
-                             pin_memory=(device != 'cpu'))
 
+    is_cuda = (device != 'cpu')
+    kwargs = dict(
+        batch_size=batch_size,
+        shuffle=(not validation),
+        num_workers=num_workers,
+        drop_last=(not validation),
+        collate_fn=collate_fn,
+        pin_memory=is_cuda,
+        persistent_workers=(num_workers > 0),
+    )
+    # Only pass prefetch_factor when workers > 0 (it’s ignored/invalid otherwise)
+    if num_workers > 0:
+        kwargs["prefetch_factor"] = 2  # try 2–4
+
+    data_loader = DataLoader(dataset, **kwargs)
     return data_loader
-

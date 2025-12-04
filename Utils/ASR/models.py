@@ -4,6 +4,7 @@ from torch import nn
 from torch.nn import TransformerEncoder
 import torch.nn.functional as F
 from .layers import MFCC, Attention, LinearNorm, ConvNorm, ConvBlock
+from text_utils import symbols as _syms
 
 class ASRCNN(nn.Module):
     def __init__(self,
@@ -77,27 +78,28 @@ class ASRS2S(nn.Module):
                  hidden_dim=512,
                  n_location_filters=32,
                  location_kernel_size=63,
-                 n_token=40):
-        super(ASRS2S, self).__init__()
+                 n_token=None):                      # <-- allow None
+        super().__init__()
+        if n_token is None:
+            n_token = len(_syms)                   # <-- auto from symbols
         self.embedding = nn.Embedding(n_token, embedding_dim)
+
+        self.sos = 0
+        self.eos = 0
+
+
         val_range = math.sqrt(6 / hidden_dim)
-        self.embedding.weight.data.uniform_(-val_range, val_range)
+        with torch.no_grad():
+            self.embedding.weight.uniform_(-val_range, val_range)
 
         self.decoder_rnn_dim = hidden_dim
         self.project_to_n_symbols = nn.Linear(self.decoder_rnn_dim, n_token)
         self.attention_layer = Attention(
-            self.decoder_rnn_dim,
-            hidden_dim,
-            hidden_dim,
-            n_location_filters,
-            location_kernel_size
+            self.decoder_rnn_dim, hidden_dim, hidden_dim, n_location_filters, location_kernel_size
         )
         self.decoder_rnn = nn.LSTMCell(self.decoder_rnn_dim + embedding_dim, self.decoder_rnn_dim)
-        self.project_to_hidden = nn.Sequential(
-            LinearNorm(self.decoder_rnn_dim * 2, hidden_dim),
-            nn.Tanh())
-        self.sos = 1
-        self.eos = 2
+        self.project_to_hidden = nn.Sequential(LinearNorm(self.decoder_rnn_dim * 2, hidden_dim), nn.Tanh())
+
 
     def initialize_decoder_states(self, memory, mask):
         """
